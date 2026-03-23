@@ -16,23 +16,38 @@ export class CodexAdapter implements CLIAdapter {
 
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
+      const { settings } = opts;
       const args: string[] = [];
-      const sid = opts.settings.sessionIds[this.name];
+      const hasSession = settings.sessionIds[this.name];
 
-      if (sid) {
-        args.push('exec', 'resume', sid, prompt);
+      if (hasSession) {
+        args.push('exec', 'resume', '--last', prompt);
       } else {
-        args.push(
-          'exec',
-          '--dangerously-bypass-approvals-and-sandbox',  // always max permissions
-          '--skip-git-repo-check',
-          prompt,
-        );
+        args.push('exec');
+
+        // Mode / sandbox
+        if (settings.mode === 'auto' && !settings.sandbox) {
+          args.push('--dangerously-bypass-approvals-and-sandbox');
+        } else if (settings.sandbox) {
+          args.push('--sandbox', settings.sandbox);
+        } else {
+          args.push('--full-auto');
+        }
+
+        args.push('--skip-git-repo-check');
+
+        // Model
+        if (settings.model) args.push('-m', settings.model);
+
+        // Web search
+        if (settings.search) args.push('--search');
+
+        args.push(prompt);
       }
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[codex] executing`);
+      log.debug(`[codex] mode=${settings.mode} sandbox=${settings.sandbox || 'yolo'} search=${settings.search}`);
       const proc = spawn(this.command, args, {
         cwd: opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
       });
@@ -46,7 +61,9 @@ export class CodexAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
-        resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+        const text = stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`;
+        // Mark session exists so next call uses --last to resume
+        resolve({ text, sessionId: code === 0 ? 'last' : undefined, error: code !== 0 });
       });
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);

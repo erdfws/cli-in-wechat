@@ -92,7 +92,12 @@ export class ClaudeAdapter implements CLIAdapter {
 
 // ─── Shared helpers ────────────────────────────────────────
 export function commandExists(cmd: string): Promise<boolean> {
-  return new Promise((resolve) => { const proc = spawn('which', [cmd], { stdio: 'pipe' }); proc.on('close', (code) => resolve(code === 0)); proc.on('error', () => resolve(false)); });
+  const bin = process.platform === 'win32' ? 'where' : 'which';
+  return new Promise((resolve) => {
+    const proc = spawn(bin, [cmd], { stdio: 'pipe', shell: process.platform === 'win32' });
+    proc.on('close', (code) => resolve(code === 0));
+    proc.on('error', () => resolve(false));
+  });
 }
 export function setupAbort(proc: ChildProcess, signal?: AbortSignal): void {
   if (!signal) return; if (signal.aborted) { proc.kill('SIGTERM'); return; }

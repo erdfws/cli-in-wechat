@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { log } from '../utils/logger.js';
 import { ILinkClient } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
@@ -26,6 +29,7 @@ export class Router {
   private active = new Map<string, ActiveTask>();
   private lastResponse = new Map<string, { tool: string; text: string }>();
   private pendingQuestions = new Map<string, PendingQuestion>();
+  private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
 
   constructor(ilink: ILinkClient, registry: AdapterRegistry, sessions: SessionManager, config: BridgeConfig) {
     this.ilink = ilink;
@@ -587,22 +591,51 @@ export class Router {
 
       case 'session': {
         const tool = settings.defaultTool || this.config.defaultTool;
-        if (!arg) {
-          // Show current session IDs (full, for copy-paste)
-          const sids = Object.entries(settings.sessionIds);
-          if (sids.length === 0) {
-            await reply('无活跃会话\n\n/session set <id> 可手动设置\n(用于从终端/其他通道接续会话)');
-          } else {
-            const lines = sids.map(([k, v]) => `${k}: ${v}`);
-            await reply(`活跃会话:\n${lines.join('\n')}\n\n复制 ID 可在终端用 claude --resume <id> 接续`);
-          }
-        } else if (arg.startsWith('set ')) {
+        if (arg.startsWith('set ')) {
           const id = arg.substring(4).trim();
           this.sessions.setSession(uid, tool, id);
           await reply(`${tool} session → ${id}\n下条消息将 --resume 此会话`);
         } else {
-          await reply('/session — 查看会话 ID\n/session set <id> — 手动设置(跨通道接续)');
+          const sids = Object.entries(settings.sessionIds);
+          const lines = sids.length > 0
+            ? sids.map(([k, v]) => `${k}: ${v}`).join('\n')
+            : '(无活跃会话)';
+          await reply(`活跃会话:\n${lines}\n\n/session set <id> 手动设置\n/resume 浏览所有历史会话`);
         }
+        return true;
+      }
+
+      case 'resume': case 'sessions': {
+        const tool = settings.defaultTool || this.config.defaultTool;
+        if (arg) {
+          // /resume <number> → pick from list, or /resume <uuid> → direct set
+          const num = parseInt(arg);
+          if (!isNaN(num) && this._lastSessionList) {
+            const pick = this._lastSessionList[num - 1];
+            if (pick) {
+              this.sessions.setSession(uid, tool, pick.id);
+              await reply(`已恢复 ${tool} 会话:\n${pick.summary}\n\nID: ${pick.id}`);
+            } else {
+              await reply(`无效编号，范围 1-${this._lastSessionList.length}`);
+            }
+          } else {
+            // Treat as UUID
+            this.sessions.setSession(uid, tool, arg.trim());
+            await reply(`${tool} session → ${arg.trim()}`);
+          }
+          return true;
+        }
+        // List all sessions for current tool
+        const list = this.listSessions(tool, settings.workDir || this.config.workDir);
+        if (list.length === 0) {
+          await reply(`${tool} 没有历史会话`);
+          return true;
+        }
+        this._lastSessionList = list;
+        const lines = list.map((s, i) =>
+          `${i + 1}. ${s.date} ${s.summary}\n   ${s.id}`
+        );
+        await reply(`${tool} 历史会话 (最近${list.length}条):\n\n${lines.join('\n\n')}\n\n回复 /resume <编号> 恢复`);
         return true;
       }
 
@@ -647,6 +680,94 @@ export class Router {
       default:
         await reply(`未知命令: /${cmd}\n/help 查看所有命令`);
         return true;
+    }
+  }
+
+  // ─── List historical sessions ───────────────────────────
+
+  private listSessions(tool: string, workDir: string): Array<{ id: string; date: string; summary: string }> {
+    try {
+      // Claude: ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+      // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+      // Gemini: different structure
+      let dir = '';
+      if (tool === 'claude') {
+        const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-');
+        dir = join(homedir(), '.claude', 'projects', encoded);
+      } else if (tool === 'codex') {
+        dir = join(homedir(), '.codex', 'sessions');
+        return this.listCodexSessions(dir);
+      } else {
+        return [];
+      }
+
+      const files = readdirSync(dir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => {
+          const fullPath = join(dir, f);
+          const id = f.replace('.jsonl', '');
+          try {
+            const stat = require('fs').statSync(fullPath);
+            const firstLines = readFileSync(fullPath, 'utf-8').split('\n').slice(0, 5);
+            let summary = '(无摘要)';
+            let date = stat.mtime.toISOString().slice(0, 16).replace('T', ' ');
+            for (const line of firstLines) {
+              if (!line.trim()) continue;
+              try {
+                const obj = JSON.parse(line);
+                if (obj.type === 'user' && obj.message?.content) {
+                  const content = typeof obj.message.content === 'string'
+                    ? obj.message.content
+                    : obj.message.content.map((b: { text?: string }) => b.text || '').join('');
+                  summary = content.substring(0, 60) + (content.length > 60 ? '...' : '');
+                  if (obj.timestamp) date = obj.timestamp.slice(0, 16).replace('T', ' ');
+                  break;
+                }
+              } catch { continue; }
+            }
+            return { id, date, summary, mtime: stat.mtime.getTime() };
+          } catch {
+            return { id, date: '', summary: '(读取失败)', mtime: 0 };
+          }
+        })
+        .sort((a, b) => b.mtime - a.mtime)
+        .slice(0, 15);
+
+      return files.map(({ id, date, summary }) => ({ id, date, summary }));
+    } catch {
+      return [];
+    }
+  }
+
+  private listCodexSessions(baseDir: string): Array<{ id: string; date: string; summary: string }> {
+    try {
+      const results: Array<{ id: string; date: string; summary: string; mtime: number }> = [];
+      const years = readdirSync(baseDir).filter(f => /^\d{4}$/.test(f));
+      for (const year of years) {
+        const months = readdirSync(join(baseDir, year)).filter(f => /^\d{2}$/.test(f));
+        for (const month of months) {
+          const days = readdirSync(join(baseDir, year, month)).filter(f => /^\d{2}$/.test(f));
+          for (const day of days) {
+            const dayDir = join(baseDir, year, month, day);
+            const files = readdirSync(dayDir).filter(f => f.endsWith('.jsonl'));
+            for (const f of files) {
+              try {
+                const stat = require('fs').statSync(join(dayDir, f));
+                const id = f.replace('.jsonl', '').replace('rollout-', '').substring(0, 40);
+                results.push({
+                  id: 'last', // codex uses --last for resume
+                  date: `${year}-${month}-${day}`,
+                  summary: f.replace('.jsonl', '').substring(0, 50),
+                  mtime: stat.mtime.getTime(),
+                });
+              } catch { continue; }
+            }
+          }
+        }
+      }
+      return results.sort((a, b) => b.mtime - a.mtime).slice(0, 10).map(({ id, date, summary }) => ({ id, date, summary }));
+    } catch {
+      return [];
     }
   }
 

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { generateWechatUin } from '../utils/crypto.js';
-import { loadCredentials, loadContextTokens } from '../config.js';
+import { loadCredentials, loadContextTokens, loadDefaultAccountId } from '../config.js';
 import type { Credentials } from '../ilink/types.js';
 
 const CHANNEL_VERSION = '1.0.2';
@@ -9,6 +9,7 @@ const MAX_CHUNK_SIZE = 2000;
 export async function sendCommand(args: string[]): Promise<void> {
   // ─── Parse arguments ─────────────────────────────────
   let targetUser: string | null = null;
+  let accountId: string | null = null;
   const messageParts: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -18,6 +19,12 @@ export async function sendCommand(args: string[]): Promise<void> {
         process.exit(1);
       }
       targetUser = args[++i];
+    } else if (args[i] === '-a' || args[i] === '--account') {
+      if (i + 1 >= args.length) {
+        console.error('错误: -a 需要指定账号 ID');
+        process.exit(1);
+      }
+      accountId = args[++i];
     } else {
       messageParts.push(args[i]);
     }
@@ -38,17 +45,19 @@ export async function sendCommand(args: string[]): Promise<void> {
   }
 
   // ─── Load credentials ────────────────────────────────
-  const credentials = loadCredentials();
+  const credentials = loadCredentials(accountId || undefined);
   if (!credentials) {
     console.error('错误: 未登录。请先运行 `npm run dev` 扫码登录。');
     process.exit(1);
   }
 
+  const activeAccountId = accountId || loadDefaultAccountId() || credentials.ilinkUserId;
+
   // ─── Determine target user ───────────────────────────
   const userId = targetUser || credentials.ilinkUserId;
 
   // ─── Load context_token ──────────────────────────────
-  const contextTokens = loadContextTokens();
+  const contextTokens = loadContextTokens(activeAccountId);
   const contextToken = contextTokens.get(userId);
 
   if (!contextToken) {
@@ -156,10 +165,12 @@ function printUsage(): void {
   console.log(`用法: wcli send [选项] <消息>
 
 选项:
+  -a, --account <accountId>  指定微信账号（默认使用默认账号）
   -u, --user <userId>    指定目标用户 ID（默认发给自己）
 
 示例:
   wcli send "hello"                    发送消息给自己
+  wcli send "hello" -a wx_xxx          使用指定微信账号发送
   wcli send "hello" -u wx_xxxxxx       发送给指定用户
   echo "hello" | wcli send             从标准输入读取消息`);
 }

@@ -5,6 +5,7 @@ dist/
 
 # Runtime data
 .wx-ai-bridge/
+*.log
 
 # IDE
 .vscode/
@@ -18,3 +19,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Temporary / generated files
+tmp/
+*.pptx

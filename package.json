@@ -13,8 +13,21 @@
     "dev:debug": "tsx src/index.ts --debug",
     "build": "tsc",
     "start": "node dist/index.js",
+    "up": "npm run build && node dist/index.js daemon start",
+    "down": "node dist/index.js daemon stop",
+    "check": "node dist/index.js daemon status",
+    "logs": "node dist/index.js daemon logs",
+    "restartd": "node dist/index.js daemon restart",
+    "account:list": "node dist/index.js account list",
+    "account:add": "node dist/index.js account add",
+    "account:default": "node dist/index.js account default",
+    "account:remove": "node dist/index.js account remove",
+    "acc:list": "node dist/index.js account list",
+    "acc:add": "node dist/index.js account add",
+    "acc:default": "node dist/index.js account default",
+    "acc:remove": "node dist/index.js account remove",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.81",

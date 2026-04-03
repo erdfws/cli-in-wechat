@@ -6,7 +6,7 @@ import { SessionManager } from './bridge/session.js';
 import { Router } from './bridge/router.js';
 import {
   loadConfig,
-  loadCredentials,
+  loadAllCredentials,
   saveCredentials,
   ensureDataDir,
 } from './config.js';
@@ -14,6 +14,16 @@ import { log, setLogLevel, LogLevel } from './utils/logger.js';
 
 async function main() {
   const subcommand = process.argv[2];
+  if (subcommand === 'account') {
+    const { accountCommand } = await import('./cli/account.js');
+    await accountCommand(process.argv.slice(3));
+    process.exit(0);
+  }
+  if (subcommand === 'daemon') {
+    const { daemonCommand } = await import('./cli/daemon.js');
+    await daemonCommand(process.argv.slice(3));
+    process.exit(0);
+  }
   if (subcommand === 'send') {
     const { sendCommand } = await import('./cli/send.js');
     await sendCommand(process.argv.slice(3));
@@ -25,6 +35,7 @@ async function main() {
 ╔══════════════════════════════════════╗
 ║       cli-in-wechat  v0.1.0        ║
 ║  Claude / Codex / Gemini / Kimi    ║
+║  OpenCode / Qwen Code              ║
 ╚══════════════════════════════════════╝
 `,
   );
@@ -57,9 +68,9 @@ async function main() {
 
   // ─── 2. WeChat login ─────────────────────────────────
 
-  let credentials = loadCredentials();
+  let accounts = loadAllCredentials();
 
-  if (!credentials) {
+  if (accounts.length === 0) {
     log.info('需要登录微信 ClawBot...');
 
     let qrGenerate: ((text: string, opts: { small: boolean }) => void) | null = null;
@@ -71,7 +82,7 @@ async function main() {
       // fallback to URL display
     }
 
-    credentials = await login((qrContent) => {
+    const credentials = await login((qrContent) => {
       if (qrGenerate) {
         qrGenerate(qrContent, { small: true });
       } else {
@@ -80,18 +91,23 @@ async function main() {
     });
 
     saveCredentials(credentials);
+    accounts = loadAllCredentials();
   } else {
-    log.info('使用已保存的登录凭据');
+    log.info(`使用已保存的登录凭据 (${accounts.length} 个账号)`);
   }
 
   // ─── 3. Start bridge ─────────────────────────────────
 
-  const ilink = new ILinkClient(credentials);
-  const sessions = new SessionManager();
-  const router = new Router(ilink, registry, sessions, config);
-
-  router.start();
-  ilink.start();
+  const clients: ILinkClient[] = [];
+  for (const account of accounts) {
+    const ilink = new ILinkClient(account.credentials, account.accountId);
+    const sessions = new SessionManager(account.accountId);
+    const router = new Router(ilink, registry, sessions, config);
+    router.start();
+    ilink.start();
+    clients.push(ilink);
+    log.info(`已启动微信账号: ${account.accountId}`);
+  }
 
   log.info(`桥接服务已启动`);
   log.info(`默认工具: ${config.defaultTool} | 可用: ${available.join(', ')}`);
@@ -102,7 +118,7 @@ async function main() {
 
   const shutdown = () => {
     log.info('正在关闭...');
-    ilink.stop();
+    clients.forEach((client) => client.stop());
     process.exit(0);
   };
 

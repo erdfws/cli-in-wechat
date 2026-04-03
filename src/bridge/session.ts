@@ -5,8 +5,10 @@ import { DEFAULT_SETTINGS, type UserSettings } from '../adapters/base.js';
 
 export class SessionManager {
   private data = new Map<string, UserSettings>();
+  private namespace: string;
 
-  constructor() {
+  constructor(namespace = 'default') {
+    this.namespace = namespace;
     this.load();
   }
 
@@ -43,7 +45,7 @@ export class SessionManager {
   }
 
   private filePath(): string {
-    return join(getSessionsDir(), 'sessions.json');
+    return join(getSessionsDir(), `sessions.${this.namespace}.json`);
   }
 
   private load(): void {

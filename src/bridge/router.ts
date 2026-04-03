@@ -1,14 +1,17 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { join, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import { createDecipheriv } from 'node:crypto';
 import { log } from '../utils/logger.js';
 import { ILinkClient } from '../ilink/client.js';
+import type { FileAttachment } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
 import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
 import type { AskUserRequest } from '../adapters/base.js';
+import { DATA_DIR } from '../config.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
 interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
@@ -19,6 +22,7 @@ const TOOL_ALIASES: Record<string, string> = {
   gemini: 'gemini', gm: 'gemini',
   kimi: 'kimi', km: 'kimi',
   opencode: 'opencode', oc: 'opencode',
+  qwen: 'qwen', qw: 'qwen',
 };
 
 export class Router {
@@ -39,8 +43,8 @@ export class Router {
   }
 
   start(): void {
-    this.ilink.onMessage((msg, text, refText) => {
-      this.handle(msg, text, refText).catch((e) => log.error('路由异常:', e));
+    this.ilink.onMessage((msg, text, refText, files) => {
+      this.handle(msg, text, refText, files).catch((e) => log.error('路由异常:', e));
     });
   }
 
@@ -66,7 +70,7 @@ export class Router {
   }
 
 
-  private async handle(msg: WeixinMessage, text: string, refText: string): Promise<void> {
+  private async handle(msg: WeixinMessage, text: string, refText: string, files: FileAttachment[]): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
 
@@ -140,16 +144,93 @@ export class Router {
     }
 
     // @tool 无 prompt → 仅切换，确认后返回
-    if (atMatch && !atMatch[2]) {
+    if (atMatch && !atMatch[2] && files.length === 0) {
       await this.ilink.sendText(uid, `已切换到 ${toolName}`);
       return;
     }
 
     if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
 
-    const prompt = atMatch ? atMatch[2].trim() : trimmed;
+    // ── Build prompt, including file context if files are received ──
+    let prompt = atMatch ? (atMatch[2]?.trim() || '') : trimmed;
+
+    // Handle received files: save locally and mention in prompt
+    if (files.length > 0) {
+      const savedPaths = await this.saveReceivedFiles(uid, files);
+      if (savedPaths.length > 0) {
+        const fileInfo = savedPaths.map(p => `- ${p}`).join('\n');
+        const fileContext = `[用户发送了以下文件，已保存到本地]:\n${fileInfo}`;
+        prompt = prompt ? `${prompt}\n\n${fileContext}` : `请处理以下文件:\n${fileInfo}`;
+      }
+    }
+
     const combined = [prompt, refText].filter(Boolean).join('\n\n');
+    if (!combined) {
+      await this.ilink.sendText(uid, `已切换到 ${toolName}`);
+      return;
+    }
     await this.exec(uid, toolName, combined);
+  }
+
+  // ─── Save received files from WeChat ──────────────────────
+
+  private async saveReceivedFiles(uid: string, files: FileAttachment[]): Promise<string[]> {
+    const savedPaths: string[] = [];
+    const receiveDir = join(DATA_DIR, 'received_files');
+    mkdirSync(receiveDir, { recursive: true });
+
+    for (const file of files) {
+      try {
+        if (file.mediaInfo) {
+          // Download from CDN and decrypt
+          const { encrypt_query_param, aes_key } = file.mediaInfo;
+          const cdnUrl = encrypt_query_param; // The param is the CDN download URL
+
+          const res = await fetch(cdnUrl);
+          if (!res.ok) {
+            log.warn(`[文件下载] HTTP ${res.status} for ${file.type}`);
+            continue;
+          }
+
+          const encryptedBuf = Buffer.from(await res.arrayBuffer());
+
+          // Decode the AES key
+          let keyBuf: Buffer;
+          if (file.type === 'image') {
+            keyBuf = Buffer.from(aes_key, 'base64');
+          } else {
+            const hexStr = Buffer.from(aes_key, 'base64').toString('utf-8');
+            keyBuf = Buffer.from(hexStr, 'hex');
+          }
+
+          // AES-128-ECB decrypt
+          const decipher = createDecipheriv('aes-128-ecb', keyBuf, null);
+          decipher.setAutoPadding(true);
+          const decrypted = Buffer.concat([decipher.update(encryptedBuf), decipher.final()]);
+
+          const ext = file.type === 'image' ? '.png' : (file.type === 'voice' ? '.amr' : (file.type === 'video' ? '.mp4' : ''));
+          const fileName = file.fileName || `${file.type}_${Date.now()}${ext}`;
+          const savePath = join(receiveDir, fileName);
+          writeFileSync(savePath, decrypted);
+          savedPaths.push(savePath);
+          log.debug(`[文件接收] 已保存: ${savePath}`);
+        } else if (file.url) {
+          // Direct URL download (some images have URL)
+          const res = await fetch(file.url);
+          if (!res.ok) continue;
+          const buf = Buffer.from(await res.arrayBuffer());
+          const fileName = file.fileName || `${file.type}_${Date.now()}.dat`;
+          const savePath = join(receiveDir, fileName);
+          writeFileSync(savePath, buf);
+          savedPaths.push(savePath);
+          log.debug(`[文件接收] 已保存 (URL): ${savePath}`);
+        }
+      } catch (err) {
+        log.error(`[文件接收] 保存失败:`, err);
+      }
+    }
+
+    return savedPaths;
   }
 
   // ─── /command → ALL are commands, never pass through ────
@@ -215,12 +296,15 @@ export class Router {
           '/yolo  auto+effort max',
           '/fast  effort low',
           '/reset  重置所有设置',
-          '/cc /cx /gm /km /oc  切工具',
+          '/cc /cx /gm /km /oc /qw  切工具',
           '',
           '— 发消息 —',
-          '@claude/@codex/@gemini/@kimi/@opencode  指定工具',
+          '@claude/@codex/@gemini/@kimi/@opencode/@qwen  指定工具',
           '>>  接力(传上条结果)',
           '@tool1>tool2  链式调用',
+          '',
+          '— 文件 —',
+          '/sendfile <路径>  发送文件到微信',
         ].join('\n'));
         return true;
 
@@ -277,9 +361,9 @@ export class Router {
         if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=需确认 plan=只读'); return true; }
         this.sessions.update(uid, { mode: v as any });
         const desc: Record<string, string> = {
-          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: --print (自带yolo)',
-          safe: 'SAFE\nClaude: 默认权限\nCodex: --full-auto\nGemini: --approval-mode default\nKimi: 默认',
-          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: /plan',
+          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: --print (自带yolo)\nQwen: --approval-mode yolo',
+          safe: 'SAFE\nClaude: 默认权限\nCodex: --full-auto\nGemini: --approval-mode default\nKimi: 默认\nQwen: --approval-mode default',
+          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: /plan\nQwen: --approval-mode plan',
         };
         await reply(desc[v]);
         return true;
@@ -640,6 +724,25 @@ export class Router {
       }
 
       // ═══════════════════════════════════════════
+      // 文件发送
+      // ═══════════════════════════════════════════
+
+      case 'sendfile': case 'sf': case 'file': {
+        if (!arg) {
+          await reply('/sendfile <路径>\n发送本地文件到微信\n\n示例:\n/sendfile ./output.txt\n/sendfile /tmp/screenshot.png');
+          return true;
+        }
+        const filePath = isAbsolute(arg) ? arg : resolve(settings.workDir || this.config.workDir, arg);
+        try {
+          await this.ilink.sendFile(uid, filePath);
+          await reply(`已发送: ${arg}`);
+        } catch (err) {
+          await reply(`发送文件失败: ${(err as Error).message}`);
+        }
+        return true;
+      }
+
+      // ═══════════════════════════════════════════
       // 不适用于微信的命令 (给出说明)
       // ═══════════════════════════════════════════
 
@@ -672,6 +775,8 @@ export class Router {
         this.sessions.update(uid, { defaultTool: 'kimi' }); await reply('→ kimi'); return true;
       case 'opencode': case 'oc':
         this.sessions.update(uid, { defaultTool: 'opencode' }); await reply('→ opencode'); return true;
+      case 'qwen': case 'qw':
+        this.sessions.update(uid, { defaultTool: 'qwen' }); await reply('→ qwen'); return true;
 
       // ═══════════════════════════════════════════
       // 未识别
@@ -846,11 +951,16 @@ export class Router {
   ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
     const adapter = this.registry.get(toolName)!;
     const extraArgs = this.config.tools[toolName]?.args;
-    const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
+    const settings = this.sessions.get(uid);
+    const hadSession = adapter.capabilities.sessionResume && !!settings.sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
-    const result = await adapter.execute(prompt, {
-      settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
+    const result = await adapter.execute(augmentPromptForFileDelivery(prompt, promptRequestsFileDelivery(prompt)), {
+      settings,
+      workDir: settings.workDir || this.config.workDir,
+      timeout: this.config.cliTimeout,
+      extraArgs,
+      signal,
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
     });
 
@@ -944,6 +1054,12 @@ export class Router {
         duration: result.duration || (Date.now() - start),
         error: result.error,
       }));
+
+      // ── Post-execution: detect and send files if user requested ──
+      if (!result.error) {
+        const workDir = this.sessions.get(uid).workDir || this.config.workDir;
+        await this.autoSendFiles(uid, prompt, result.text, workDir);
+      }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
@@ -954,4 +1070,134 @@ export class Router {
       this.active.delete(`${uid}:${toolName}`);
     }
   }
+
+  /**
+   * After AI executes, scan the output for file paths and auto-send them.
+   */
+  private async autoSendFiles(uid: string, prompt: string, output: string, workDir: string): Promise<void> {
+    // Extract file paths from AI output
+    const filePaths = extractFilePaths(output, workDir);
+    if (filePaths.length === 0) return;
+
+    log.debug(`[autoSendFiles] 检测到 ${filePaths.length} 个文件路径`);
+
+    let sentCount = 0;
+    for (const fp of filePaths.slice(0, 5)) { // limit to 5 files
+      try {
+        if (existsSync(fp)) {
+          await this.ilink.sendFile(uid, fp);
+          sentCount++;
+          await sleep(500); // rate limit
+        }
+      } catch (err) {
+        log.warn(`[autoSendFiles] 发送 ${fp} 失败: ${(err as Error).message}`);
+      }
+    }
+
+    if (sentCount > 0) {
+      log.debug(`[autoSendFiles] 成功发送 ${sentCount}/${filePaths.length} 个文件`);
+    }
+  }
+}
+
+// ─── Helpers ───────────────────────────────────────────────
+
+/** Extract file paths from AI output text */
+export function extractFilePaths(text: string, workDir: string): string[] {
+  const paths = new Set<string>();
+
+  // Pre-process: strip ANSI codes, normalize whitespace
+  const clean = text.replace(/\x1b\[[0-9;]*m/g, '');
+  const addPath = (rawPath: string) => {
+    const normalized = normalizeExtractedPath(rawPath, workDir);
+    if (normalized) paths.add(normalized);
+  };
+
+  // Strategy 0: explicit delivery marker
+  const markerRegex = /\[\[\s*sendfile\s*:\s*([^\]\n]+?)\s*\]\]/gi;
+  let match: RegExpExecArray | null;
+  while ((match = markerRegex.exec(clean)) !== null) {
+    addPath(match[1]);
+  }
+
+  // Strategy 1: Match absolute paths (handles backtick-wrapped, quoted, bare)
+  // Captures paths starting with /Users, /home, /tmp, /var, etc.
+  const absPathRegex = /[`'"]*(\/?(?:Users|home|tmp|var|opt|etc|mnt|srv|private)\/[^\s`'"<>|;,)\]}>]+)/g;
+  while ((match = absPathRegex.exec(clean)) !== null) {
+    addPath('/' + match[1].replace(/^\//, ''));
+  }
+
+  // Strategy 2: Match paths in markdown code blocks: `path` or ```\npath\n```
+  const backtickRegex = /`([^`\n]+(?:\.[A-Za-z0-9_-]+|\/[^`\n]+))`/g;
+  while ((match = backtickRegex.exec(clean)) !== null) {
+    addPath(match[1]);
+  }
+
+  // Strategy 3: Match "Created/Wrote/Saved/file:" style patterns
+  const actionRegex = /(?:created?|wrote?|saved?|generated?|exported?|produced?|file|output|path)[:\s]+[`'"]*([^\s`'"<>|;,)\]}>]+)/gi;
+  while ((match = actionRegex.exec(clean)) !== null) {
+    addPath(match[1]);
+  }
+
+  // Strategy 4: Match relative paths like ./dist/a.pdf or dist/a.pdf
+  const relPathRegex = /[`'"]*((?:\.{1,2}\/|[A-Za-z0-9_-]+\/)[^\s`'"<>|;,)\]}>]+)/g;
+  while ((match = relPathRegex.exec(clean)) !== null) {
+    addPath(match[1]);
+  }
+
+  return [...paths];
+}
+
+/** Clean up extracted path by removing trailing/surrounding junk */
+function cleanPath(p: string): string {
+  return p
+    .replace(/^[`'"]+/, '')     // strip leading quotes/backticks
+    .replace(/[`'"]+$/, '')     // strip trailing quotes/backticks
+    .replace(/[.,:;!?]+$/, '')  // strip trailing punctuation
+    .replace(/\)$/, '')         // strip trailing paren
+    .trim();
+}
+
+function normalizeExtractedPath(rawPath: string, workDir: string): string | null {
+  const cleaned = cleanPath(rawPath);
+  if (!isValidPath(cleaned)) return null;
+  if (cleaned.startsWith('/')) return cleaned;
+  return resolve(workDir, cleaned);
+}
+
+/** Check if a cleaned path looks valid (not a URL, has extension, etc.) */
+function isValidPath(p: string): boolean {
+  if (p.length < 4) return false;
+  if (p.includes('*') || p.includes('?') || p.includes('{')) return false;
+  if (p.startsWith('http://') || p.startsWith('https://')) return false;
+  if (!p.includes('.')) return false;  // must have file extension
+  return true;
+}
+
+export function promptRequestsFileDelivery(prompt: string): boolean {
+  return [
+    /发送(?:这个|该)?文件(?:给我|给用户|回微信|回来)?/,
+    /把(?:生成的|结果)?文件发给我/,
+    /发给我(?:文件)?/,
+    /回传(?:文件|给我|给用户)/,
+    /send (?:me|the user) (?:the )?file/i,
+    /send (?:it|them) back/i,
+    /attach (?:the )?file/i,
+    /deliver (?:the )?file/i,
+  ].some((pattern) => pattern.test(prompt));
+}
+
+function augmentPromptForFileDelivery(prompt: string, mustDeliver: boolean): string {
+  const instruction = mustDeliver
+    ? '用户明确要求把生成的文件发回微信。只要你产出了最终要交付的本地文件，必须在最终回复末尾逐行输出 `[[sendfile:相对或绝对路径]]`，这样系统会自动把文件发给用户。不要遗漏。'
+    : '如果你在本机创建了需要发回微信给用户的文件，请在最终回复中单独列出 `[[sendfile:相对或绝对路径]]`。只写真实存在且最终要交付的文件路径。';
+
+  return [
+    prompt,
+    instruction,
+  ].join('\n\n');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

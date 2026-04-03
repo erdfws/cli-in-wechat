@@ -5,6 +5,7 @@ import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
 import { KimiAdapter } from './kimi.js';
 import { OpenCodeAdapter } from './opencode.js';
+import { QwenAdapter } from './qwen.js';
 
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
@@ -17,6 +18,7 @@ export class AdapterRegistry {
     this.register(new GeminiAdapter());
     this.register(new KimiAdapter());
     this.register(new OpenCodeAdapter());
+    this.register(new QwenAdapter());
   }
 
   private register(adapter: CLIAdapter): void {

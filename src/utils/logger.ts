@@ -11,8 +11,19 @@ export function setLogLevel(level: LogLevel): void {
   currentLevel = level;
 }
 
+export function formatLogTimestamp(date: Date = new Date()): string {
+  const hhmmss = new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  return `${hhmmss}.${ms}`;
+}
+
 function ts(): string {
-  return new Date().toISOString().slice(11, 23);
+  return formatLogTimestamp();
 }
 
 export const log = {

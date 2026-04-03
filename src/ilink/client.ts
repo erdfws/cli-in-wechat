@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { generateWechatUin } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { savePollCursor, loadPollCursor, saveContextTokens } from '../config.js';
+import { uploadFile, MediaType } from './media.js';
 import type {
   Credentials,
   WeixinMessage,
@@ -12,11 +14,32 @@ import type {
 
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
+const TEXT_LIKE_EXTS = new Set([
+  'txt', 'md', 'markdown', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf',
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+  'py', 'pyw', 'rb', 'rs', 'go', 'java', 'kt', 'kts', 'scala', 'clj',
+  'c', 'h', 'cpp', 'hpp', 'cc', 'cxx', 'cs', 'swift', 'm', 'mm',
+  'html', 'htm', 'css', 'scss', 'less', 'sass', 'xml', 'svg',
+  'sh', 'bash', 'zsh', 'fish', 'bat', 'cmd', 'ps1',
+  'sql', 'graphql', 'gql',
+  'env', 'gitignore', 'dockerignore', 'editorconfig',
+  'csv', 'tsv', 'log', 'diff', 'patch',
+  'r', 'R', 'rmd', 'lua', 'pl', 'pm', 'php', 'vue', 'svelte',
+  'makefile', 'cmake', 'gradle', 'tf', 'hcl',
+]);
 
-export type MessageHandler = (msg: WeixinMessage, text: string, refText: string) => void;
+export interface FileAttachment {
+  type: 'image' | 'file' | 'video' | 'voice';
+  fileName?: string;
+  url?: string;
+  mediaInfo?: { encrypt_query_param: string; aes_key: string };
+}
+
+export type MessageHandler = (msg: WeixinMessage, text: string, refText: string, files: FileAttachment[]) => void;
 
 export class ILinkClient {
   private credentials: Credentials;
+  private accountId: string;
   private pollCursor: string;
   private running = false;
   private contextTokens = new Map<string, string>();
@@ -25,9 +48,10 @@ export class ILinkClient {
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
 
-  constructor(credentials: Credentials) {
+  constructor(credentials: Credentials, accountId = credentials.ilinkUserId) {
     this.credentials = credentials;
-    this.pollCursor = loadPollCursor();
+    this.accountId = accountId;
+    this.pollCursor = loadPollCursor(this.accountId);
   }
 
   onMessage(handler: MessageHandler): void {
@@ -51,14 +75,14 @@ export class ILinkClient {
 
   start(): void {
     this.running = true;
-    log.info('iLink 消息轮询已启动');
+    log.info(`[${this.accountId}] iLink 消息轮询已启动`);
     this.pollLoop();
   }
 
   stop(): void {
     this.running = false;
     this.abortController?.abort();
-    log.info('iLink 消息轮询已停止');
+    log.info(`[${this.accountId}] iLink 消息轮询已停止`);
   }
 
   // ─── Long-polling loop ─────────────────────────────────
@@ -82,7 +106,7 @@ export class ILinkClient {
         }
 
         if (error.errcode === -14 || error.errcode === -13) {
-          log.error('会话已过期，需要重新登录 (删除 ~/.wx-ai-bridge/credentials.json 后重启)');
+          log.error(`[${this.accountId}] 会话已过期，需要重新登录`);
           this.running = false;
           return;
         }
@@ -127,7 +151,7 @@ export class ILinkClient {
 
       if (data.get_updates_buf) {
         this.pollCursor = data.get_updates_buf;
-        savePollCursor(this.pollCursor);
+        savePollCursor(this.pollCursor, this.accountId);
       }
 
       return data.msgs || [];
@@ -144,17 +168,17 @@ export class ILinkClient {
 
     // Cache context_token for this user
     this.contextTokens.set(msg.from_user_id, msg.context_token);
-    saveContextTokens(this.contextTokens);
+    saveContextTokens(this.contextTokens, this.accountId);
 
     log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
-    const { text, refText } = parseMessage(msg);
-    if (!text && !refText) return;
+    const { text, refText, files } = parseMessage(msg);
+    if (!text && !refText && files.length === 0) return;
 
-    log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}`);
+    log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}${files.length > 0 ? ` (+${files.length} files)` : ''}`);
 
     for (const handler of this.handlers) {
       try {
-        handler(msg, text, refText);
+        handler(msg, text, refText, files);
       } catch (err) {
         log.error('消息处理器异常:', err);
       }
@@ -184,6 +208,89 @@ export class ILinkClient {
         await sleep(300); // preserve ordering between chunks
       }
     }
+  }
+
+  // ─── Send file/image ──────────────────────────────────
+
+  async sendFile(userId: string, filePath: string): Promise<void> {
+    if (!existsSync(filePath)) {
+      throw new Error(`文件不存在: ${filePath}`);
+    }
+
+    const token = this.contextTokens.get(userId);
+    if (!token) {
+      throw new Error(`无法发送文件给 ${userId}: 缺少 context_token (用户必须先发一条消息)`);
+    }
+
+    const fileName = filePath.split('/').pop() || 'file';
+    const fileExt = (fileName.split('.').pop() || '').toLowerCase();
+    const isTextFile = TEXT_LIKE_EXTS.has(fileExt) || fileExt === '';
+
+    try {
+      const result = await uploadFile(this.credentials, filePath, userId);
+      const mediaPayload = {
+        media: {
+          encrypt_query_param: result.encryptQueryParam,
+          aes_key: result.aesKey,
+          encrypt_type: 1,
+        },
+      };
+
+      let item: MessageItem;
+      switch (result.mediaType) {
+        case MediaType.IMAGE:
+          item = { type: 2 as const, image_item: mediaPayload };
+          break;
+        case MediaType.VIDEO:
+          item = { type: 5 as const, video_item: mediaPayload };
+          break;
+        case MediaType.VOICE:
+          item = { type: 3 as const, voice_item: mediaPayload };
+          break;
+        default:
+          item = {
+            type: 4 as const,
+            file_item: { ...mediaPayload, file_name: result.fileName, md5: result.fileMd5, len: String(result.fileSize) },
+          };
+          break;
+      }
+
+      log.debug(`[发送文件] CDN上传成功: ${result.fileName}`);
+      await this.sendRawMessage(userId, token, [item]);
+      return;
+    } catch (err) {
+      log.warn(`[发送文件] CDN上传失败: ${(err as Error).message}`);
+      if (isTextFile) {
+        log.warn(`[发送文件] 作为文本内容回退发送: ${fileName}`);
+        await this.sendFileAsText(userId, filePath, fileName);
+        return;
+      }
+
+      throw new Error(`文件上传失败: ${(err as Error).message}`);
+    }
+  }
+
+  /** Send file content as formatted text message (reliable fallback) */
+  async sendFileAsText(userId: string, filePath: string, fileName?: string): Promise<void> {
+    const name = fileName || filePath.split('/').pop() || 'file';
+    const raw = readFileSync(filePath);
+
+    // Check if content is valid UTF-8 text
+    const text = raw.toString('utf-8');
+    const isBinary = text.includes('\uFFFD') || /[\x00-\x08\x0E-\x1F]/.test(text.substring(0, 1000));
+
+    if (isBinary) {
+      // Binary file that CDN upload failed for — notify user
+      const stat = statSync(filePath);
+      await this.sendText(userId, `📎 文件: ${name}\n大小: ${formatBytes(stat.size)}\n路径: ${filePath}\n\n⚠️ 二进制文件无法通过文本发送，请通过其他方式获取`);
+      return;
+    }
+
+    // Send text content with filename header
+    const header = `📄 ${name}`;
+    const separator = '─'.repeat(Math.min(name.length + 4, 30));
+    const content = `${header}\n${separator}\n${text}`;
+    await this.sendText(userId, content);
   }
 
   private async sendRawMessage(
@@ -301,8 +408,9 @@ export class ILinkClient {
 
 // ─── Helpers ───────────────────────────────────────────────
 
-function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
+function parseMessage(msg: WeixinMessage): { text: string; refText: string; files: FileAttachment[] } {
   const parts: string[] = [];
+  const files: FileAttachment[] = [];
   let refText = '';
   for (const item of msg.item_list) {
     if (item.type === 1 && item.text_item?.text) {
@@ -310,6 +418,44 @@ function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
     } else if (item.type === 3 && item.voice_item?.text) {
       parts.push(item.voice_item.text); // voice-to-text transcription
     }
+
+    // Extract file attachments
+    if (item.type === 2 && item.image_item) {
+      files.push({
+        type: 'image',
+        url: item.image_item.url,
+        mediaInfo: item.image_item.media ? {
+          encrypt_query_param: item.image_item.media.encrypt_query_param,
+          aes_key: item.image_item.media.aes_key,
+        } : undefined,
+      });
+    } else if (item.type === 4 && item.file_item) {
+      files.push({
+        type: 'file',
+        fileName: item.file_item.file_name,
+        mediaInfo: item.file_item.media ? {
+          encrypt_query_param: item.file_item.media.encrypt_query_param,
+          aes_key: item.file_item.media.aes_key,
+        } : undefined,
+      });
+    } else if (item.type === 5 && item.video_item) {
+      files.push({
+        type: 'video',
+        mediaInfo: item.video_item.media ? {
+          encrypt_query_param: item.video_item.media.encrypt_query_param,
+          aes_key: item.video_item.media.aes_key,
+        } : undefined,
+      });
+    } else if (item.type === 3 && item.voice_item?.media) {
+      files.push({
+        type: 'voice',
+        mediaInfo: {
+          encrypt_query_param: item.voice_item.media.encrypt_query_param,
+          aes_key: item.voice_item.media.aes_key,
+        },
+      });
+    }
+
     // Extract quoted message content (WeChat 引用消息)
     const ref = item.ref_msg;
     if (ref) {
@@ -322,7 +468,7 @@ function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
   }
   // WeChat embeds quoted content inline as "[引用]:\n<content>" — strip the prefix
   const text = parts.join('\n').trim().replace(/^\[引用\]:\n?/, '');
-  return { text, refText };
+  return { text, refText, files };
 }
 
 function chunkText(text: string, maxLen: number): string[] {
@@ -352,4 +498,11 @@ function chunkText(text: string, maxLen: number): string[] {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }

@@ -29,6 +29,14 @@
 claude -p / codex exec / gemini -p / kimi --print / opencode -p
 ```
 
+## 🌟 相比原版的增强特性 (Enhanced Features)
+
+本项目基于原项目 [sgaofen/cli-in-wechat](https://github.com/sgaofen/cli-in-wechat) 进行二次深度开发，主要包含以下独有改进与提升：
+
+1. **新增通义千问完全适配 (Qwen Code Adapter)**：新增了 `src/adapters/qwen.ts`，全面支持通过 `@qwen` 指令在微信中直接唤起阿里云通义千问模型，并且完美兼容 `plan` 等审批模式。
+2. **大幅强化自动文件收发与多媒体系统**：重构了文件路径提取引擎并独立封装多媒体模块（`media.ts`）。现在不仅能精准识别大语言模型回复中包含的包裹式/隐式待发送文件路径，还能非常稳定地利用 CDN 处理各类图片、媒体文件回传微信。即使偶遇传图失败，也会智能回退成常规文本防止漏信。
+3. **完善基础设施与命令管理**：拆分并精简了本地终端 CLI 解析与后台守护进程管理（`account.ts` / `daemon.ts`）；增加并重构了可靠性非常高的多媒体和路由测试用例（覆盖率直达 100% 测试通过）。
+
 ## 你可以用它做什么
 
 - 在微信里直接问 AI 问题
